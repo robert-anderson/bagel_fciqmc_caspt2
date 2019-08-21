@@ -35,7 +35,10 @@ def file_extract(fname, anchor_pattern, split_offset, line_offset=0, type_=float
         stdout, stderr, _ = shell('grep "{}" {} -A{} | tail -n1'.format(anchor_pattern, fname, line_offset))
     else:
         stdout, stderr, _ = shell('grep "{}" {}'.format(anchor_pattern, fname))
-    return type_(str(stdout, 'utf-8').split()[split_offset])
+    try:
+        return type_(str(stdout, 'utf-8').split()[split_offset])
+    except IndexError:
+        return float('nan')
 
 def get_line_metadata(line, token, type_=int):
     if type_==int:
@@ -132,6 +135,7 @@ class NeciInputFile(StructuredFile):
         'seed {}'.format(self['seed']),
         'startsinglepart'.format(self['startsinglepart']),
         'shiftdamp {}'.format(self['shiftdamp']),
+        'diagshift {}'.format(self['diagshift']),
         'truncinitiator',
         'addtoinitiator {}'.format(self['addtoinitiator']),
         'allrealcoeff',
@@ -190,6 +194,7 @@ default_neci_data = {
     'startsinglepart': 100,
     'nw': 10000,
     'shiftdamp': 0.05,
+    'diagshift': 0.1,
     'addtoinitiator': 3.0,
     'stepsshift': 5,
     'nmcyc': -1,
@@ -221,10 +226,11 @@ default_neci_data = {
     'trel': False
 }
 
-def hf_block(trel, thresh=1e-10, maxiter=100, robust=False, gaunt=None, breit=None):
+def hf_block(trel, thresh=1e-10, maxiter=100, charge=0, robust=False, gaunt=None, breit=None):
     block = {
         'thresh':thresh,
         'maxiter':maxiter,
+        'charge':charge,
         'robust':robust
     }
     if not trel:
@@ -236,15 +242,18 @@ def hf_block(trel, thresh=1e-10, maxiter=100, robust=False, gaunt=None, breit=No
     return block
 
 def casscf_block(trel, ncas, ncore, topt=True, thresh=1e-10, maxiter=100,
-        robust=False, canonical=False, external_rdm=None):
+        robust=False, canonical=False, external_rdm=None, charge=None):
     block = {
         'thresh': thresh, 
         'maxiter': maxiter,
         'nact': ncas,
+        'fci_algorithm': 'hz',
         'nclosed': ncore,
         'canonical': canonical,
         'robust': robust
     }
+    if charge is not None:
+        block['charge'] = charge
     if trel:
         block['title'] = 'zcasscf'
         block['state'] = [1]
@@ -296,8 +305,8 @@ rdm_map = {
     'spinfree_ThreeRDM.1': 'fciqmc_0_0.rdm3',
     'spinfree_CASPT2_AUX.1': 'fciqmc_0_0.rdm4f'
 }
-def bagel(config, dirname, bagel_dirname=None, neci_dirname=None, exe='/users/k1507071/code/rja_bagel/obj/src/BAGEL', 
-        numthreads=1, mpiranks=1, destructive=False):
+def bagel(config, dirname, bagel_dirname=None, neci_dirname=None, exe='/users/k1507071/lustre/code/rja_bagel/obj/src/BAGEL', 
+        numthreads=1, mpiranks=1, destructive=False, quiet=False):
     if not os.path.exists(dirname): os.makedirs(dirname)
     relocator = check_hardlink if destructive else check_copyfile
     infile = os.path.abspath('{}/bagel.json'.format(dirname))
@@ -326,11 +335,14 @@ def bagel(config, dirname, bagel_dirname=None, neci_dirname=None, exe='/users/k1
     # if this BAGEL instance did not emit an FCIDUMP, link to previous  
     if not os.path.exists('{}/FCIDUMP'.format(dirname)):
         check_hardlink('{}/FCIDUMP'.format(bagel_dirname), '{}/FCIDUMP'.format(dirname))
-    print('BAGEL instance completed ({:.2f} seconds)'.format(time))
-    return time
+    gradient = file_extract(outfile, 'Using the second-order algorithm', 3, 2)
+    if not quiet:
+        print('BAGEL instance completed ({:.2f} seconds)'.format(time))
+        print('CASSCF Gradient {}'.format(gradient))
+    return gradient, time
 
 #'/users/k1507071/code/neci_merge/build_ib/bin'
-def neci(config, dirname, bagel_dirname=None, neci_dirname=None, neci_bin_dirname='/users/k1507071/lustre/code/neci_link/bin',
+def neci(config, dirname, bagel_dirname=None, neci_dirname=None, neci_bin_dirname='/users/k1507071/lustre/code/neci_merge/build/bin',
         mpiranks=1, destructive=False, quiet=False):
     if not os.path.exists(dirname): os.makedirs(dirname)
     relocator = check_hardlink if destructive else check_copyfile
@@ -355,8 +367,8 @@ def neci(config, dirname, bagel_dirname=None, neci_dirname=None, neci_bin_dirnam
     stdout, stderr, time = shell(
         'cd {}'.format(dirname),
         'module purge',
-        'module load /users/k1507071/opt/modules/gcc/7.4.0',
-        'module load /users/k1507071/opt/modules/openmpi/4.0.1/gnu_7.4.0',
+        'module load libs/openmpi/3.1.4/gcc/7.3.0 libs/lapack/3.8.0/gcc-7.3.0',
+        '. $HOME/intel/mkl/bin/mklvars.sh intel64',
         'mpirun -np {} {}/{} {} > {} 2> {}'.format(
             mpiranks, neci_bin_dirname, 'kdneci' if trel else 'dneci', infile, outfile, errfile)
     )
@@ -366,22 +378,22 @@ def neci(config, dirname, bagel_dirname=None, neci_dirname=None, neci_bin_dirnam
         print('2RDM energy {:.8f}'.format(energy))
     return energy, time
 
-def exact_caspt2_config(molecule, trel, ncas, ncore, gaunt=None, breit=None):
+def exact_caspt2_config(molecule, trel, ncas, ncore, charge=0, gaunt=None, breit=None):
     return {
         'bagel':[
             molecule,
-            hf_block(trel, thresh=1e-10, maxiter=100, robust=False, gaunt=gaunt, breit=breit),
-            casscf_block(trel, ncas, ncore),
+            hf_block(trel, thresh=1e-10, maxiter=100, charge=charge, robust=False, gaunt=gaunt, breit=breit),
+            casscf_block(trel, ncas, ncore, charge=charge),
             caspt2_block(trel)
         ]
     }
 
-def init_casscf_config(molecule, trel, ncas, ncore, gaunt=None, breit=None):
+def init_casscf_config(molecule, trel, ncas, ncore, charge=0, gaunt=None, breit=None):
     return {
         'bagel':[
             molecule,
-            hf_block(trel, thresh=1e-10, maxiter=100, robust=False, gaunt=gaunt, breit=breit),
-            casscf_block(trel, ncas, ncore, topt=1, maxiter=0, external_rdm='noref'),
+            hf_block(trel, thresh=1e-10, maxiter=100, robust=False, charge=charge, gaunt=gaunt, breit=breit),
+            casscf_block(trel, ncas, ncore, topt=1, maxiter=0, external_rdm='noref', charge=charge),
             fci_block(trel, ncas, ncore, only_ints=True)
         ]
     }
@@ -422,62 +434,69 @@ def fockdump_to_caspt2_config(config):
     config['bagel'][-1]['external_rdm'] = 'fciqmc'
     return config
 
-molecule = {
-    'title': 'molecule',
-    'geometry': [
-        {'xyz': [0.0, 0.0, 0.0], 'atom': 'N'},
-        {'xyz': [1.4, 0.0, 0.0], 'atom': 'N'}
-    ],
-    'basis': '/users/k1507071/code/bagel/src/basis/svp.json',
-    'df_basis': '/users/k1507071/code/bagel/src/basis/svp-jkfit.json',
-    'angstrom': True
-}
-
-trel = False
-ncas, ncore = 6, 4
-bagel(exact_caspt2_config(molecule, trel, ncas, ncore), 'exact')
-
-neci_mpiranks = 12
-neci_data = deepcopy(default_neci_data)
-neci_data['nw'] = 1e5
-neci_data['rdm']['mrpt']=None
-neci_data['rdm']['samplingiters'] = 200
-neci_data['rdm']['startiter'] = 500
-neci_data['twf'] = None
-neci_data['ss']['popscore'] = 100
-neci_data['ss']['startiter'] = 1
-
-niter_casscf = 15
 
 def last_successful_casscf_iter():
-    return None
+    i = 0
+    while 1:
+        if not os.path.exists('neci_{}'.format(i)):
+            return i-1
+        i+=1
 
-def auto_init(molecule, trel, ncas, ncore):
+def get_bagel_config_from_disk(it):
+    with open('bagel_{}/bagel.json'.format(it), 'r') as f: return json.load(f)
+
+def get_neci_data_from_disk(it):
+    with open('neci_{}/neci.json'.format(it), 'r') as f: return json.load(f)
+
+def get_configs_from_disk(it):
+    return get_bagel_config_from_disk(it), get_neci_data_from_disk(it)
+
+def auto_init(molecule, neci_data, neci_mpiranks, bagel_numthreads, bagel_mpiranks, trel, ncas, ncore, charge):
     print('================== CASSCF iteration {:<3}=================='.format(0))
-    init_bagel_config = init_casscf_config(molecule, trel, ncas, ncore)
-    bagel(init_bagel_config, 'bagel_0')
+    init_bagel_config = init_casscf_config(molecule, trel, ncas, ncore, charge=charge)
+    bagel(init_bagel_config, 'bagel_0', numthreads=bagel_numthreads, mpiranks=bagel_mpiranks)
     neci(neci_data, 'neci_0', 'bagel_0', mpiranks=neci_mpiranks)
-    iter_bagel_config = init_to_iter_casscf_config(init_bagel_config)
 
-def auto_iter(prev_iter=None):
+def auto_iter(neci_mpiranks, bagel_numthreads, bagel_mpiranks, prev_iter=None, neci_data=None):
     if prev_iter is None: prev_iter = last_successful_casscf_iter()
-    print('================== CASSCF iteration {:<3}=================='.format(i))
-    bagel(iter_bagel_config, 'bagel_'+str(prev_iter+1), 'bagel_'+str(prev_iter), 'neci_'+str(prev_iter))
+    if neci_data is None:
+        bagel_config, neci_data = get_configs_from_disk(prev_iter)
+    else:
+        bagel_config = get_bagel_config_from_disk(prev_iter)
+    if prev_iter==0: bagel_config = init_to_iter_casscf_config(bagel_config)
+    print('================== CASSCF iteration {:<3}=================='.format(prev_iter+1))
+    grad, _ = bagel(bagel_config, 'bagel_'+str(prev_iter+1), 'bagel_'+str(prev_iter), 'neci_'+str(prev_iter), 
+            numthreads=bagel_numthreads, mpiranks=bagel_mpiranks)
     neci(neci_data, 'neci_'+str(prev_iter+1), 'bagel_'+str(prev_iter+1), mpiranks=neci_mpiranks)
+    return grad
 
-def auto_fockmat(prev_iter=None):
+def auto_casscf(neci_mpiranks, bagel_numthreads, bagel_mpiranks, conv_grad, niter_casscf=1, neci_data=None):
+    for i in range(niter_casscf):
+        grad = auto_iter(neci_mpiranks, bagel_numthreads, bagel_mpiranks, neci_data=neci_data)
+        if abs(grad)<conv_grad:
+            print('CASSCF CONVERGED WITHIN {}'.format(conv_grad))
+            return
+
+def auto_fockmat(neci_mpiranks, bagel_numthreads, bagel_mpiranks, prev_iter=None, neci_data=None):
     if prev_iter is None: prev_iter = last_successful_casscf_iter()
+    if neci_data is None:
+        bagel_config, neci_data = get_configs_from_disk(prev_iter)
+    else:
+        bagel_config = get_bagel_config_from_disk(prev_iter)
     print('=============== PSEUDOCANONICAL iteration ===============')
-    pseudocanonical_bagel_config = iter_to_pseudocanonical_config(iter_bagel_config)
-    bagel(pseudocanonical_bagel_config, 'bagel_pseudocanonical', 'bagel_'+str(prev_iter), 'neci_'+str(prev_iter))
+    bagel_config = iter_to_pseudocanonical_config(bagel_config)
+    bagel(bagel_config, 'bagel_pseudocanonical', 'bagel_'+str(prev_iter), 'neci_'+str(prev_iter),
+            numthreads=bagel_numthreads, mpiranks=bagel_mpiranks)
     neci(neci_data, 'neci_pseudocanonical', 'bagel_pseudocanonical', mpiranks=neci_mpiranks)
 
     print('=============== FOCK MATRIX iteration ===============')
-    fockdump_bagel_config = pseudocanonical_to_fockdump_config(pseudocanonical_bagel_config)
-    bagel(fockdump_bagel_config, 'bagel_fockdump', 'bagel_pseudocanonical', 'neci_pseudocanonical')
+    bagel_config = pseudocanonical_to_fockdump_config(bagel_config)
+    bagel(bagel_config, 'bagel_fockdump', 'bagel_pseudocanonical', 'neci_pseudocanonical',
+            numthreads=bagel_numthreads, mpiranks=bagel_mpiranks)
     reformat_fockmat('bagel_fockdump/FOCKMAT')
 
-def auto_caspt2(ovlps=(4, 5, 6, 7, 8, 9)):
+def auto_caspt2(neci_mpiranks, bagel_numthreads, bagel_mpiranks, ovlps=(4, 5, 6, 7, 8, 9), neci_data=None):
+    if neci_data is None: neci_data= get_neci_data_from_disk('pseudocanonical')
     print('================= CASPT2 iteration =================')
     neci_data['rdm']['samplingiters'] = 500
     neci_data['rdm']['mrpt'] = {
@@ -486,14 +505,10 @@ def auto_caspt2(ovlps=(4, 5, 6, 7, 8, 9)):
         'promotionfractions': 1
     }
     neci(neci_data, 'neci_caspt2', 'bagel_fockdump', mpiranks=neci_mpiranks)
-    caspt2_bagel_config = fockdump_to_caspt2_config(fockdump_bagel_config)
+    bagel_config = get_bagel_config_from_disk('fockdump')
+    bagel_config = fockdump_to_caspt2_config(bagel_config)
     for ovlp in ovlps:
-        caspt2_bagel_config['bagel'][-1]['thresh_overlap'] = 10**-ovlp
-        bagel(caspt2_bagel_config, 'bagel_caspt2/thresh_{}'.format(ovlp), 'bagel_pseudocanonical', 'neci_caspt2')
-
-auto_init(molecule, trel, ncas, ncore)
-for i in range(niter_casscf):
-    auto_iter(i)
-auto_fockmat(i)
-auto_caspt2()
+        bagel_config['bagel'][-1]['thresh_overlap'] = 10**-ovlp
+        bagel(bagel_config, 'bagel_caspt2/thresh_{}'.format(ovlp), 'bagel_pseudocanonical', 'neci_caspt2',
+            numthreads=bagel_numthreads, mpiranks=bagel_mpiranks)
 
